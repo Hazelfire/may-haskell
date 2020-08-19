@@ -1,0 +1,21 @@
+{
+  "name": "may-haskell",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "serverless": "^1.78.1"
+  },
+  "dependencies": {
+    "serverless-haskell": "^0.12.1"
+  }
+}

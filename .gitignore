@@ -1,0 +1,6 @@
+.stack-work/
+*~
+.serverless/
+node_modules/
+dist/
+dist-newstyle
