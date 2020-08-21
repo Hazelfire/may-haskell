@@ -38,15 +38,52 @@ library
     , amazonka-core
     , amazonka-dynamodb
     , base >=4.7 && <5
+    , bytestring
     , exceptions
     , graphql >=0.9.0.0
     , hspec
+    , http-types
+    , iso8601-time
     , jwt
     , lens
     , mtl
     , serverless-haskell
     , text
+    , time
     , unordered-containers
+    , wai
+    , warp
+  default-language: Haskell2010
+
+executable may-haskell-dev-server
+  main-is: Main.hs
+  other-modules:
+      Paths_may_haskell
+  hs-source-dirs:
+      dev
+  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      aeson
+    , amazonka
+    , amazonka-core
+    , amazonka-dynamodb
+    , base >=4.7 && <5
+    , bytestring
+    , exceptions
+    , graphql >=0.9.0.0
+    , hspec
+    , http-types
+    , iso8601-time
+    , jwt
+    , lens
+    , may-haskell
+    , mtl
+    , serverless-haskell
+    , text
+    , time
+    , unordered-containers
+    , wai
+    , warp
   default-language: Haskell2010
 
 executable may-haskell-exe
@@ -62,16 +99,22 @@ executable may-haskell-exe
     , amazonka-core
     , amazonka-dynamodb
     , base >=4.7 && <5
+    , bytestring
     , exceptions
     , graphql >=0.9.0.0
     , hspec
+    , http-types
+    , iso8601-time
     , jwt
     , lens
     , may-haskell
     , mtl
     , serverless-haskell
     , text
+    , time
     , unordered-containers
+    , wai
+    , warp
   default-language: Haskell2010
 
 test-suite may-haskell-test
@@ -88,14 +131,20 @@ test-suite may-haskell-test
     , amazonka-core
     , amazonka-dynamodb
     , base >=4.7 && <5
+    , bytestring
     , exceptions
     , graphql >=0.9.0.0
     , hspec
+    , http-types
+    , iso8601-time
     , jwt
     , lens
     , may-haskell
     , mtl
     , serverless-haskell
     , text
+    , time
     , unordered-containers
+    , wai
+    , warp
   default-language: Haskell2010

@@ -34,6 +34,12 @@ dependencies:
 - amazonka
 - amazonka-core
 - exceptions
+- wai
+- http-types
+- bytestring
+- warp
+- iso8601-time
+- time
 
 
 library:
@@ -45,6 +51,15 @@ executables:
   may-haskell-exe:
     main:                Main.hs
     source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - may-haskell
+  may-haskell-dev-server:
+    main:                Main.hs
+    source-dirs:         dev
     ghc-options:
     - -threaded
     - -rtsopts

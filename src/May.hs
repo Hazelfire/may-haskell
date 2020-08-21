@@ -15,7 +15,7 @@ import Data.Aeson.Embedded (Embedded)
 import Control.Lens ((&), (.~), (^.))
 import qualified Control.Lens as Lens
 import qualified Language.GraphQL as GraphQL
-import qualified Language.GraphQL.Type.Schema as GraphQL hiding (EnumType)
+import qualified Language.GraphQL.Type.Schema as GraphQL hiding (EnumType, ScalarType)
 import qualified Language.GraphQL.Type as GraphQL
 import qualified Language.GraphQL.Error as GraphQL
 import qualified Language.GraphQL.Type.Out as GraphQLOut
@@ -38,10 +38,14 @@ import qualified Control.Exception.Base as Exception
 import qualified Control.Monad.Catch as Catch
 import Data.Int (Int32)
 import Network.AWS.Prelude (NonEmpty((:|)))
+import qualified Data.Time.ISO8601 as ISO8601
+import qualified Data.Time as Time
+import qualified Data.Time.Clock.POSIX as Time
 
 handler :: APIGateway.APIGatewayProxyRequest (Embedded Query) -> IO (APIGateway.APIGatewayProxyResponse (Embedded Aeson.Value))
 handler evt = do
   let body =  evt^.APIGateway.requestBodyEmbedded
+  print evt
   case body of
     Just query -> do
       env  <- AWS.newEnv AWS.Discover
@@ -80,8 +84,9 @@ instance ToGraphQL Node where
 data Task = Task
   { taskId :: Text
   , taskName :: Text
+  , taskParent :: Text
   , taskDuration :: Double
-  , taskDue :: Maybe Int32
+  , taskDue :: Maybe Time.UTCTime
   }
 
 data Folder = Folder 
@@ -147,26 +152,30 @@ instance FromDynamoDBRecord Task where
      tid <-  stringField record "node_id"
      name <-  stringField record "name"
      duration <- numberField record "duration"
-     due <-  fmap floor <$> maybeField (numberField record "duration")
-     pure $ Task tid name duration due
+     pid <- stringField record "pid"
+     dueMilis <- maybeField (numberField record "due")
+     let due = Time.posixSecondsToUTCTime . fromInteger . floor .(/1000) <$> dueMilis
+     pure $ Task tid name pid duration due
 
 class ToGraphQL a where
    toGraphQL ::  a -> GraphQL.Value
 
 instance ToGraphQL Task where
-  toGraphQL (Task{taskId=tid,taskName=name,taskDuration=duration,taskDue=dueM}) = GraphQL.Object (HashMap.fromList (
+  toGraphQL (Task{taskId=tid,taskName=name,taskParent=pid,taskDuration=duration,taskDue=dueM}) = GraphQL.Object (HashMap.fromList (
     case dueM of 
       Just due -> 
         [("__typename", GraphQL.String "Task")
         , ("name", GraphQL.String name)
         , ("duration", GraphQL.Float duration)
         , ("id", GraphQL.String tid)
-        , ("due", GraphQL.Int due)
+        , ("due", GraphQL.String . Text.pack $ ISO8601.formatISO8601Millis due)
+        , ("parent", GraphQL.String pid)
         ]
       Nothing ->
         [("__typename", GraphQL.String "Task")
         , ("name", GraphQL.String name)
         , ("duration", GraphQL.Float duration)
+        , ("parent", GraphQL.String pid)
         , ("id", GraphQL.String tid)
         ]
       ))
@@ -176,20 +185,26 @@ instance ToGraphQL a => ToGraphQL [a] where
 
 
 data UnauthenticatedException = UnauthenticatedException
-  deriving (Show)
 
 
 instance Exception.Exception UnauthenticatedException where
   displayException _ = "Endpoint requires an access token" 
 
-data ServerError = ServerError
-  deriving (Show)
+instance Show UnauthenticatedException where
+  show _ = "Endpoint requires an access token" 
 
-data InvalidArgsError = InvalidArgsError
-  deriving (Show)
+data ServerError = ServerError Text
+
+data InvalidArgsError = InvalidArgsError Text
+
+instance Show InvalidArgsError where
+  show (InvalidArgsError err) = "Invalid Arguments error: " ++ Text.unpack err
 
 instance Exception.Exception ServerError where
   displayException _ = "This should never occur" 
+
+instance Show ServerError where
+  show (ServerError err) = "Server Error: "  ++ Text.unpack err
 
 instance Exception.Exception InvalidArgsError where
   displayException _ = "Invalid arguments"
@@ -200,7 +215,6 @@ nodesResolver = GraphQLOut.ValueResolver nodesField $ do
   sub <- lift getSub
   let query = DynamoDB.query "MayNodeTable" & DynamoDB.qKeyConditionExpression .~ Just "user_id = :user_id" & DynamoDB.qExpressionAttributeValues .~ (HashMap.fromList [(":user_id", DynamoDB.attributeValue &  DynamoDB.avS .~ Just sub)])
   response <- AWS.send query
-  lift . lift . lift . lift $ print response
   let items = Either.rights $ List.map fromDynamoDB (response^.DynamoDB.qrsItems) :: [Node]
   pure $ toGraphQL items
 
@@ -234,7 +248,7 @@ taskType :: GraphQLOut.ObjectType MyIO
 taskType = GraphQLOut.ObjectType "Task" (Just "a task") [] (HashMap.fromList 
    [ ("name", fieldResolver "name" "the name of the task" (GraphQLOut.NonNullScalarType GraphQL.string) )
    , ("id", fieldResolver "id" "the unique id of the task" (GraphQLOut.NonNullScalarType GraphQL.string) )
-   , ("due", fieldResolver "due" "the timestamp of when the task is due" (GraphQLOut.NamedScalarType GraphQL.int) )
+   , ("due", fieldResolver "due" "the timestamp of when the task is due" (GraphQLOut.NamedScalarType GraphQL.string) )
    , ("parent", fieldResolver "parent" "The id of the folder that contains that task" (GraphQLOut.NonNullScalarType GraphQL.id) )
    , ("duration", fieldResolver "duration" "the duration of the task in hours" (GraphQLOut.NonNullScalarType GraphQL.float) )
    , ("__typename", fieldResolver "__typename" "type" (GraphQLOut.NonNullScalarType GraphQL.string))
@@ -253,7 +267,13 @@ fieldResolver name description graphqlType =
   case HashMap.lookup name =<< object of
     Just val-> pure val
     _ -> 
-      Catch.throwM (GraphQL.ResolverException ServerError)
+      case graphqlType of
+        GraphQLOut.NamedScalarType _ -> pure GraphQL.Null
+        GraphQLOut.NamedObjectType _ -> pure GraphQL.Null
+        GraphQLOut.NamedInterfaceType _ -> pure GraphQL.Null
+        GraphQLOut.NamedUnionType _ -> pure GraphQL.Null
+        _ -> 
+          Catch.throwM (GraphQL.ResolverException (ServerError $ Text.concat ["could not resolve field ", name]))
 
 
 meField :: GraphQLOut.Field MyIO
@@ -291,16 +311,24 @@ patchNodeResolver  = GraphQLOut.ValueResolver (GraphQLOut.Field (Just "applies t
           let writeRequests = fmap (patchCommandToWriteRequest sub) (first :| rest)
           _ <- AWS.send (DynamoDB.batchWriteItem & DynamoDB.bwiRequestItems .~ (HashMap.fromList [("MayNodeTable", writeRequests)]))
           pure $ GraphQL.Object (HashMap.fromList [("ok", GraphQL.Boolean True)])
-        _ ->
-          Catch.throwM (GraphQL.ResolverException InvalidArgsError)
+        Right [] -> do
+          pure $ GraphQL.Object (HashMap.fromList [("ok", GraphQL.Boolean True)])
+        Left err ->
+          Catch.throwM (GraphQL.ResolverException (InvalidArgsError $ Text.concat ["could not decode patch command, ", err]))
     Nothing ->
-          Catch.throwM (GraphQL.ResolverException InvalidArgsError)
+          Catch.throwM (GraphQL.ResolverException (InvalidArgsError "no args as argument"))
 
 dynoString :: Text -> DynamoDB.AttributeValue
 dynoString string = DynamoDB.attributeValue & DynamoDB.avS .~ (Just string)
 
 patchCommandToWriteRequest :: Text -> PatchCommand -> DynamoDB.WriteRequest
 patchCommandToWriteRequest sub (UpdateCommand (UpdateFolder x)) =
+   let 
+      putRequest = DynamoDB.putRequest & DynamoDB.prItem .~ (HashMap.insert "user_id" (dynoString sub) (toDynamoDb x))
+   in
+  DynamoDB.writeRequest & DynamoDB.wrPutRequest .~ 
+     (Just putRequest)
+patchCommandToWriteRequest sub (UpdateCommand (UpdateTask x)) =
    let 
       putRequest = DynamoDB.putRequest & DynamoDB.prItem .~ (HashMap.insert "user_id" (dynoString sub) (toDynamoDb x))
    in
@@ -337,19 +365,30 @@ gqlField :: FromGraphQL a => GraphQL.Value -> Text -> Parser a
 gqlField record key = do
    object <- maybeToRight (Text.concat ["Expecting field to be object: ", key]) (asGqlObject record)
    field <- maybeToRight (Text.concat ["Expecting field ", key]) (HashMap.lookup key object)
-   fromGraphQL field
+   prefixError key $  fromGraphQL field
 
 asGqlObject :: GraphQL.Value -> Maybe (HashMap.HashMap Text GraphQL.Value)
 asGqlObject (GraphQL.Object obj) = Just obj
 asGqlObject _ = Nothing
 
+prefixError :: Text -> Parser a -> Parser a
+prefixError prefix (Left err) = Left $ Text.concat [prefix,": ",err]
+prefixError _ a = a
+
+data PatchCommandType = UpdateCommandType | DeleteCommandType
+
+instance FromGraphQL PatchCommandType where
+  fromGraphQL (GraphQL.Enum "DELETE") = pure $ DeleteCommandType
+  fromGraphQL (GraphQL.Enum "UPDATE") = pure $ UpdateCommandType
+  fromGraphQL _ = Left $ "PatchCommandType must be DELETE or UPDATE"
+
 instance FromGraphQL PatchCommand where
-  fromGraphQL value = do
-      patchType <- gqlField value "type" :: Parser Text
+  fromGraphQL value = prefixError "PatchCommand" $ do
+      patchType <- gqlField value "type" :: Parser PatchCommandType
       case patchType of
-         "DELETE" -> 
+         DeleteCommandType-> 
             DeleteCommand <$> gqlField value "id"
-         "UPDATE" -> do
+         UpdateCommandType -> do
             folderM <- (maybeField $ gqlField value "folder" ) :: Parser (Maybe FolderUpdate)
             case folderM of
               Just folder ->
@@ -359,7 +398,13 @@ instance FromGraphQL PatchCommand where
                 
 
 instance FromGraphQL a => FromGraphQL [a] where
-   fromGraphQL (GraphQL.List a) = pure $ Either.rights (List.map fromGraphQL a)
+   fromGraphQL (GraphQL.List a) = 
+      let 
+         children = (List.map fromGraphQL a)
+      in
+        case Either.lefts children of
+          [] -> Right $ Either.rights children
+          b -> Left $ Text.intercalate ", " b
    fromGraphQL _ = Left "Should be list"
 
 data UpdateNode = UpdateFolder FolderUpdate | UpdateTask TaskUpdate
@@ -382,7 +427,7 @@ instance ToDynamoDb FolderUpdate where
       
 
 instance FromGraphQL FolderUpdate where
-  fromGraphQL value = 
+  fromGraphQL value = prefixError "FolderUpdate" $ 
     FolderUpdate <$> gqlField value "id"
                  <*> gqlField value "name"
                  <*> gqlField value "parent"
@@ -393,7 +438,7 @@ data TaskUpdate = TaskUpdate
     , taskUpdateName :: Text
     , taskUpdateParent :: Text
     , taskUpdateDuration :: Double
-    , taskUpdateDue :: Maybe Int32
+    , taskUpdateDue :: Maybe Time.UTCTime
     }
 
 instance ToDynamoDb TaskUpdate where
@@ -404,15 +449,29 @@ instance ToDynamoDb TaskUpdate where
                       , ("name", DynamoDB.attributeValue & DynamoDB.avS .~ (Just name))
                       , ("parent", DynamoDB.attributeValue & DynamoDB.avS .~ (Just parent))
                       , ("duration", DynamoDB.attributeValue & DynamoDB.avN .~ (Just (Text.pack (show duration))))
-                      , ("due", DynamoDB.attributeValue & DynamoDB.avN .~ (Just (Text.pack (show due))))
+                      , ("due", DynamoDB.attributeValue & DynamoDB.avN .~ (Just (Text.pack $ show (fromRational (toRational (Time.utcTimeToPOSIXSeconds due) * 1000):: Double) )))
+                      ]
+     Nothing -> 
+         HashMap.fromList [ ("node_id", DynamoDB.attributeValue & DynamoDB.avS .~ (Just tid))
+                      , ("name", DynamoDB.attributeValue & DynamoDB.avS .~ (Just name))
+                      , ("parent", DynamoDB.attributeValue & DynamoDB.avS .~ (Just parent))
+                      , ("duration", DynamoDB.attributeValue & DynamoDB.avN .~ (Just (Text.pack (show duration))))
                       ]
 instance FromGraphQL TaskUpdate where
-  fromGraphQL value = 
+  fromGraphQL value = prefixError "TaskUpdate" $
     TaskUpdate <$> gqlField value "id"
                  <*> gqlField value "name"
                  <*> gqlField value "parent"
                  <*> gqlField value "duration"
                  <*> (maybeField (gqlField value "due"))
+
+instance FromGraphQL Time.UTCTime where
+  fromGraphQL (GraphQL.String iso8601) =
+                 case ISO8601.parseISO8601 (Text.unpack iso8601) of
+                     Just result -> pure $ result
+                     Nothing -> Left $ "UTC time must be valid ISO8601"
+  fromGraphQL _ = Left $ "UTC time must be string"
+
   
 patchNodeArg :: GraphQLIn.Argument
 patchNodeArg = GraphQLIn.Argument (Just "arguments to give to patch nodes") (GraphQLIn.NonNullListType patchCommandType) Nothing
@@ -435,12 +494,12 @@ folderInputType = GraphQLIn.InputObjectType "PatchFolder" (Just "an update to a 
     )
 
 taskInputType :: GraphQLIn.InputObjectType
-taskInputType = GraphQLIn.InputObjectType "PatchFolder" (Just "an update to a folder") (HashMap.fromList
-    [ ("parent", GraphQLIn.InputField (Just "change the task (containing folder)") (GraphQLIn.NonNullScalarType GraphQL.string) Nothing)
+taskInputType = GraphQLIn.InputObjectType "PatchTask" (Just "an update to a task") (HashMap.fromList
+    [ ("parent", GraphQLIn.InputField (Just "change the task (containing folder)") (GraphQLIn.NonNullScalarType GraphQL.id) Nothing)
     , ("name", GraphQLIn.InputField (Just "change the name of the task") (GraphQLIn.NonNullScalarType GraphQL.string) Nothing)
     , ("id", GraphQLIn.InputField (Just "the id of the task you want to change") (GraphQLIn.NonNullScalarType GraphQL.id) Nothing)
     , ("duration", GraphQLIn.InputField (Just "change the duration of the task (in hours)") (GraphQLIn.NonNullScalarType GraphQL.float) Nothing)
-    , ("due", GraphQLIn.InputField (Just "change the due date of the task (posix time in milliseconds)") (GraphQLIn.NamedScalarType GraphQL.int) Nothing)
+    , ("due", GraphQLIn.InputField (Just "change the due date of the task (posix time in milliseconds)") (GraphQLIn.NamedScalarType GraphQL.string) Nothing)
     ]
     )
 
