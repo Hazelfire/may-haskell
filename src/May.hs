@@ -210,13 +210,21 @@ instance Exception.Exception InvalidArgsError where
   displayException _ = "Invalid arguments"
 
 
+collectErrors :: [Parser a] -> Parser [a]
+collectErrors lst = 
+  case Either.lefts lst of
+    [] -> pure $ Either.rights lst
+    lefts -> Left $ Text.intercalate ", " lefts
+
 nodesResolver :: GraphQLOut.Resolver MyIO
 nodesResolver = GraphQLOut.ValueResolver nodesField $ do
   sub <- lift getSub
   let query = DynamoDB.query "MayNodeTable" & DynamoDB.qKeyConditionExpression .~ Just "user_id = :user_id" & DynamoDB.qExpressionAttributeValues .~ (HashMap.fromList [(":user_id", DynamoDB.attributeValue &  DynamoDB.avS .~ Just sub)])
   response <- AWS.send query
-  let items = Either.rights $ List.map fromDynamoDB (response^.DynamoDB.qrsItems) :: [Node]
-  pure $ toGraphQL items
+  case collectErrors $ List.map fromDynamoDB (response^.DynamoDB.qrsItems) :: Parser [Node] of
+    Right values -> pure $ toGraphQL values
+    Left err -> 
+      Catch.throwM (GraphQL.ResolverException (ServerError err))
 
 getSub :: MyIO Text
 getSub = do
@@ -299,19 +307,25 @@ resolvers = HashMap.fromList [("me", meResolver)]
 mutations :: HashMap.HashMap Text (GraphQLOut.Resolver MyIO)
 mutations = HashMap.fromList [("patchNodes", patchNodeResolver)]
 
+
 patchNodeResolver :: GraphQLOut.Resolver MyIO
-patchNodeResolver  = GraphQLOut.ValueResolver (GraphQLOut.Field (Just "applies the given edits to the node") patchNodeResultType (HashMap.fromList [("args", patchNodeArg)])) $ do
+patchNodeResolver  = 
+  let 
+    (GraphQLInputType patchNodeInput decodeGraphql) = graphqlSchema
+  in
+
+  GraphQLOut.ValueResolver (GraphQLOut.Field (Just "applies the given edits to the node") patchNodeResultType (HashMap.fromList [("args", GraphQLIn.Argument (Just "arguments to patch node") patchNodeInput Nothing)])) $ do
   (GraphQL.Arguments arguments) <- asks GraphQL.arguments
   sub <- lift getSub
   let argsM = HashMap.lookup "args" arguments
   case argsM of
     Just args -> 
-      case (fromGraphQL args :: Either Text [PatchCommand])of
+      case (decodeGraphql args :: Either Text [PatchCommand])of
         Right (first : rest) -> do
           let writeRequests = fmap (patchCommandToWriteRequest sub) (first :| rest)
           _ <- AWS.send (DynamoDB.batchWriteItem & DynamoDB.bwiRequestItems .~ (HashMap.fromList [("MayNodeTable", writeRequests)]))
           pure $ GraphQL.Object (HashMap.fromList [("ok", GraphQL.Boolean True)])
-        Right [] -> do
+        Right [] ->
           pure $ GraphQL.Object (HashMap.fromList [("ok", GraphQL.Boolean True)])
         Left err ->
           Catch.throwM (GraphQL.ResolverException (InvalidArgsError $ Text.concat ["could not decode patch command, ", err]))
@@ -342,30 +356,34 @@ patchCommandToWriteRequest sub (DeleteCommand nid) =
      (Just deleteRequest)
       
 
-class FromGraphQL a where
-   fromGraphQL :: GraphQL.Value -> Parser a
+data PatchCommandInput = PatchCommandInput {
+      patchCommandInputType :: PatchCommandType,
+      patchCommandInputFolder :: Maybe FolderUpdate,
+      patchCommandInputTask :: Maybe TaskUpdate,
+      patchCommandInputId :: Maybe Text
+      }
 
 data PatchCommand = UpdateCommand UpdateNode | DeleteCommand Text
+instance FromGraphQL PatchCommand where
+  graphqlSchema =
+    let (GraphQLInputType type_ decode) = graphqlSchema
+    in 
+     GraphQLInputType type_ $ \v -> do
+        patchCommandInput <- decode v
+        case patchCommandInputType patchCommandInput of
+          DeleteCommandType ->  do
+            id_ <- maybeToRight "delete command should have id field" (patchCommandInputId patchCommandInput)
+            pure $ DeleteCommand id_
+          UpdateCommandType ->
+            case patchCommandInputFolder patchCommandInput of
+              Just folderInput -> pure $ UpdateCommand $ UpdateFolder folderInput
+              Nothing -> do
+                task <- maybeToRight "update command needs either task or folder update" (patchCommandInputTask patchCommandInput)
+                pure $ UpdateCommand $ UpdateTask task
+              
 
 
 
-instance FromGraphQL Text where
-   fromGraphQL (GraphQL.String obj) = pure obj
-   fromGraphQL _ = Left "Expecting a text object"
-
-instance FromGraphQL Double where
-   fromGraphQL (GraphQL.Float obj) = pure obj
-   fromGraphQL _ = Left "Expecting a float object"
-
-instance FromGraphQL Int32 where
-   fromGraphQL (GraphQL.Int obj) = pure obj
-   fromGraphQL _ = Left "Expecting a int object"
-
-gqlField :: FromGraphQL a => GraphQL.Value -> Text -> Parser a
-gqlField record key = do
-   object <- maybeToRight (Text.concat ["Expecting field to be object: ", key]) (asGqlObject record)
-   field <- maybeToRight (Text.concat ["Expecting field ", key]) (HashMap.lookup key object)
-   prefixError key $  fromGraphQL field
 
 asGqlObject :: GraphQL.Value -> Maybe (HashMap.HashMap Text GraphQL.Value)
 asGqlObject (GraphQL.Object obj) = Just obj
@@ -378,34 +396,34 @@ prefixError _ a = a
 data PatchCommandType = UpdateCommandType | DeleteCommandType
 
 instance FromGraphQL PatchCommandType where
-  fromGraphQL (GraphQL.Enum "DELETE") = pure $ DeleteCommandType
-  fromGraphQL (GraphQL.Enum "UPDATE") = pure $ UpdateCommandType
-  fromGraphQL _ = Left $ "PatchCommandType must be DELETE or UPDATE"
+  graphqlSchema = 
+     let type_ = GraphQLIn.NonNullEnumType (GraphQL.EnumType "PatchCommandType" (Just "The type of the command, either update or delete") (HashMap.fromList [("DELETE", GraphQL.EnumValue (Just "DELETE")),("UPDATE", GraphQL.EnumValue (Just "UPDATE"))]))
+      in
+        GraphQLInputType type_ $ \v -> 
+          case v of
+            (GraphQL.Enum "DELETE") -> pure DeleteCommandType
+            (GraphQL.Enum "UPDATE") -> pure UpdateCommandType
+            _ -> Left "Expected patch command type to be DELETE or UPDATE"
 
-instance FromGraphQL PatchCommand where
-  fromGraphQL value = prefixError "PatchCommand" $ do
-      patchType <- gqlField value "type" :: Parser PatchCommandType
-      case patchType of
-         DeleteCommandType-> 
-            DeleteCommand <$> gqlField value "id"
-         UpdateCommandType -> do
-            folderM <- (maybeField $ gqlField value "folder" ) :: Parser (Maybe FolderUpdate)
-            case folderM of
-              Just folder ->
-                pure $ UpdateCommand $ UpdateFolder folder
-              Nothing ->
-                UpdateCommand . UpdateTask <$> gqlField value "task"
+            
+instance FromGraphQL PatchCommandInput where
+  graphqlSchema = inputObject "PatchCommand" "a command to change or add something about the nodes" $
+   PatchCommandInput <$> gqlField "type" "delete or update action"
+                <*> gqlMaybeField "folder" "the folder if you wish to update a folder"
+                <*> gqlMaybeField "task" "the task if you wish to update a task"
+                <*> gqlMaybeField "id" "the id if you want to delete a node"
                 
 
 instance FromGraphQL a => FromGraphQL [a] where
-   fromGraphQL (GraphQL.List a) = 
-      let 
-         children = (List.map fromGraphQL a)
+   graphqlSchema  = 
+     let 
+       (GraphQLInputType childType decodeChild ) = graphqlSchema
+       type_ = GraphQLIn.NonNullListType childType
       in
-        case Either.lefts children of
-          [] -> Right $ Either.rights children
-          b -> Left $ Text.intercalate ", " b
-   fromGraphQL _ = Left "Should be list"
+        GraphQLInputType type_ $ \v -> 
+          case v of
+            (GraphQL.List list) -> sequenceA $ List.map decodeChild list
+            _ -> Left "Expected to be list"
 
 data UpdateNode = UpdateFolder FolderUpdate | UpdateTask TaskUpdate
 
@@ -422,16 +440,10 @@ instance ToDynamoDb FolderUpdate where
    toDynamoDb (FolderUpdate{folderUpdateId=fid,folderUpdateName=name,folderUpdateParent=parent}) =
      HashMap.fromList [ ("node_id", DynamoDB.attributeValue & DynamoDB.avS .~ (Just fid))
                     , ("name", DynamoDB.attributeValue & DynamoDB.avS .~ (Just name))
-                    , ("parent", DynamoDB.attributeValue & DynamoDB.avS .~ (Just parent))
+                    , ("pid", DynamoDB.attributeValue & DynamoDB.avS .~ (Just parent))
+                    , ("type", DynamoDB.attributeValue & DynamoDB.avS .~ (Just "folder"))
                     ]
       
-
-instance FromGraphQL FolderUpdate where
-  fromGraphQL value = prefixError "FolderUpdate" $ 
-    FolderUpdate <$> gqlField value "id"
-                 <*> gqlField value "name"
-                 <*> gqlField value "parent"
-     
 
 data TaskUpdate = TaskUpdate 
     { taskUpdateId :: Text
@@ -447,9 +459,10 @@ instance ToDynamoDb TaskUpdate where
      Just due -> 
        HashMap.fromList [ ("node_id", DynamoDB.attributeValue & DynamoDB.avS .~ (Just tid))
                       , ("name", DynamoDB.attributeValue & DynamoDB.avS .~ (Just name))
-                      , ("parent", DynamoDB.attributeValue & DynamoDB.avS .~ (Just parent))
+                      , ("pid", DynamoDB.attributeValue & DynamoDB.avS .~ (Just parent))
                       , ("duration", DynamoDB.attributeValue & DynamoDB.avN .~ (Just (Text.pack (show duration))))
                       , ("due", DynamoDB.attributeValue & DynamoDB.avN .~ (Just (Text.pack $ show (fromRational (toRational (Time.utcTimeToPOSIXSeconds due) * 1000):: Double) )))
+                    , ("type", DynamoDB.attributeValue & DynamoDB.avS .~ (Just "task"))
                       ]
      Nothing -> 
          HashMap.fromList [ ("node_id", DynamoDB.attributeValue & DynamoDB.avS .~ (Just tid))
@@ -457,54 +470,115 @@ instance ToDynamoDb TaskUpdate where
                       , ("parent", DynamoDB.attributeValue & DynamoDB.avS .~ (Just parent))
                       , ("duration", DynamoDB.attributeValue & DynamoDB.avN .~ (Just (Text.pack (show duration))))
                       ]
-instance FromGraphQL TaskUpdate where
-  fromGraphQL value = prefixError "TaskUpdate" $
-    TaskUpdate <$> gqlField value "id"
-                 <*> gqlField value "name"
-                 <*> gqlField value "parent"
-                 <*> gqlField value "duration"
-                 <*> (maybeField (gqlField value "due"))
 
 instance FromGraphQL Time.UTCTime where
-  fromGraphQL (GraphQL.String iso8601) =
+  graphqlSchema = 
+     let type_ = GraphQLIn.NonNullScalarType GraphQL.string
+     in
+        GraphQLInputType type_ $ \v -> 
+          case v of
+            (GraphQL.String iso8601) -> 
                  case ISO8601.parseISO8601 (Text.unpack iso8601) of
                      Just result -> pure $ result
-                     Nothing -> Left $ "UTC time must be valid ISO8601"
-  fromGraphQL _ = Left $ "UTC time must be string"
+                     Nothing -> Left $ "Posixtime must be valid ISO8601"
+            _ ->  Left "Posixtime must be string (IS08601)"
+   
 
-  
-patchNodeArg :: GraphQLIn.Argument
-patchNodeArg = GraphQLIn.Argument (Just "arguments to give to patch nodes") (GraphQLIn.NonNullListType patchCommandType) Nothing
+data GraphQLInputType a = GraphQLInputType GraphQLIn.Type (GraphQL.Value -> Parser a)
 
-patchCommandType :: GraphQLIn.Type
-patchCommandType = GraphQLIn.NonNullInputObjectType ( GraphQLIn.InputObjectType  "PatchCommand" (Just "a command to change something about the nodes") (HashMap.fromList 
-   [ ("type", GraphQLIn.InputField (Just "delete or update action") patchCommandTypeType Nothing)
-   , ("id", GraphQLIn.InputField (Just "the id if the action is to delete") (GraphQLIn.NamedScalarType GraphQL.id) Nothing)
-   , ("folder", GraphQLIn.InputField (Just "the folder if you wish to update a folder") (GraphQLIn.NamedInputObjectType folderInputType ) Nothing)
-   , ("task", GraphQLIn.InputField (Just "the task if you wish to update a task") (GraphQLIn.NamedInputObjectType taskInputType ) Nothing)
-   ]
-   ))
+class FromGraphQL a where
+  graphqlSchema :: GraphQLInputType a
 
-folderInputType :: GraphQLIn.InputObjectType
-folderInputType = GraphQLIn.InputObjectType "PatchFolder" (Just "an update to a folder") (HashMap.fromList
-    [ ("parent", GraphQLIn.InputField (Just "change the parent (containing folder)") (GraphQLIn.NonNullScalarType GraphQL.string) Nothing)
-    , ("name", GraphQLIn.InputField (Just "change the name of the folder") (GraphQLIn.NonNullScalarType GraphQL.string) Nothing)
-    , ("id", GraphQLIn.InputField (Just "the id of the folder you want to change") (GraphQLIn.NonNullScalarType GraphQL.id) Nothing)
-    ]
-    )
+instance FromGraphQL Text where
+  graphqlSchema = 
+     let type_ = GraphQLIn.NonNullScalarType GraphQL.string
+      in
+        GraphQLInputType type_ $ \v -> 
+          case v of
+            (GraphQL.String st) -> pure st
+            _ -> Left "Expected to be string"
 
-taskInputType :: GraphQLIn.InputObjectType
-taskInputType = GraphQLIn.InputObjectType "PatchTask" (Just "an update to a task") (HashMap.fromList
-    [ ("parent", GraphQLIn.InputField (Just "change the task (containing folder)") (GraphQLIn.NonNullScalarType GraphQL.id) Nothing)
-    , ("name", GraphQLIn.InputField (Just "change the name of the task") (GraphQLIn.NonNullScalarType GraphQL.string) Nothing)
-    , ("id", GraphQLIn.InputField (Just "the id of the task you want to change") (GraphQLIn.NonNullScalarType GraphQL.id) Nothing)
-    , ("duration", GraphQLIn.InputField (Just "change the duration of the task (in hours)") (GraphQLIn.NonNullScalarType GraphQL.float) Nothing)
-    , ("due", GraphQLIn.InputField (Just "change the due date of the task (posix time in milliseconds)") (GraphQLIn.NamedScalarType GraphQL.string) Nothing)
-    ]
-    )
+instance FromGraphQL Double where
+   graphqlSchema =
+     let type_ = GraphQLIn.NonNullScalarType GraphQL.float
+     in
+       GraphQLInputType type_ $ \v ->
+          case v of
+            (GraphQL.Float dbl) -> pure dbl
+            _ -> Left "Expected to be a double"
 
-patchCommandTypeType :: GraphQLIn.Type
-patchCommandTypeType = GraphQLIn.NonNullEnumType (GraphQL.EnumType "PatchCommandType" (Just "The type of the command, either update or delete") (HashMap.fromList [("DELETE", GraphQL.EnumValue (Just "DELETE")),("UPDATE", GraphQL.EnumValue (Just "UPDATE"))]))
+instance FromGraphQL Int32 where
+   graphqlSchema =
+     let type_ = GraphQLIn.NonNullScalarType GraphQL.int
+     in
+       GraphQLInputType type_ $ \v ->
+          case v of
+            (GraphQL.Int int) -> pure int
+            _ -> Left "Expected to be a int"
+      
+gqlField :: FromGraphQL a => Text -> Text -> GraphQLInputFields a
+gqlField name description = 
+   let 
+     (GraphQLInputType childType childDecoder)= graphqlSchema
+     type_ = (name, GraphQLIn.InputField (Just description) childType Nothing)
+   in
+     GraphQLInputFields [type_] $ \record -> do
+       object <- maybeToRight (Text.concat ["Expecting field to be object: ", name]) (asGqlObject record)
+       field <- maybeToRight (Text.concat ["Expecting field ", name]) (HashMap.lookup name object)
+       prefixError name $  childDecoder field
+
+gqlMaybeField :: FromGraphQL a => Text -> Text -> GraphQLInputFields (Maybe a)
+gqlMaybeField name description = 
+   let 
+     (GraphQLInputType childType childDecoder)= graphqlSchema
+     newType = 
+       case childType of 
+         GraphQLIn.NonNullScalarType a -> GraphQLIn.NamedScalarType a
+         GraphQLIn.NonNullInputObjectType a -> GraphQLIn.NamedInputObjectType a
+         GraphQLIn.NonNullEnumType a-> GraphQLIn.NamedEnumType a
+         GraphQLIn.NonNullListType a-> GraphQLIn.ListType a 
+         a -> a
+     type_ = (name, GraphQLIn.InputField (Just description) newType Nothing)
+   in
+     GraphQLInputFields [type_] $ \record -> do
+       object <- maybeToRight (Text.concat ["Expecting field to be object: ", name]) (asGqlObject record)
+       case HashMap.lookup name object of
+         Just a -> 
+           prefixError name $ Just <$> (childDecoder a)
+         Nothing -> 
+           prefixError name $ pure $ Nothing
+           
+     
+
+data GraphQLInputFields a = GraphQLInputFields [(Text, GraphQLIn.InputField)] (GraphQL.Value -> Parser a)
+
+instance Functor GraphQLInputFields where
+   fmap mapfunc (GraphQLInputFields type_ func) = GraphQLInputFields type_ (\v -> mapfunc <$> func v )
+
+instance Applicative GraphQLInputFields where
+   (GraphQLInputFields type1_ func) <*> (GraphQLInputFields type2_ val) = GraphQLInputFields (type1_ ++ type2_) $ (\v -> func v <*> val v )
+   pure a = GraphQLInputFields [] (const . pure $ a)
+
+instance FromGraphQL FolderUpdate where
+  graphqlSchema = inputObject "FolderUpdate" "an update to a folder" $
+    FolderUpdate <$> gqlField "id" "the id of the folder you want to change"
+                 <*> gqlField "name" "change the name of the folder"
+                 <*> gqlField "parent" "change the parent of the folder (move the folder)"
+
+instance FromGraphQL TaskUpdate where
+  graphqlSchema = inputObject "TaskUpdate" "an update to a task" $
+    TaskUpdate <$> gqlField "id" "the id of the task you want to change"
+               <*> gqlField "name" "change the name of the task"
+               <*> gqlField "parent" "change the parent of the task (move the task)"
+               <*> gqlField "duration" "change the duration of the task"
+               <*> gqlMaybeField "due" "change the due date of the task"
+
+inputObject :: Text -> Text -> GraphQLInputFields a -> GraphQLInputType a
+inputObject name description (GraphQLInputFields fields decoder) =
+  let 
+    type_ = GraphQLIn.NonNullInputObjectType $ GraphQLIn.InputObjectType name (Just description) (HashMap.fromList fields)
+  in GraphQLInputType type_ decoder
+
 
 patchNodeResultType :: GraphQLOut.Type MyIO
 patchNodeResultType = GraphQLOut.NonNullObjectType $ GraphQLOut.ObjectType "PathNodeResponse" Nothing [] (HashMap.fromList [("ok", fieldResolver "ok" "Whether the patch suceeded" (GraphQLOut.NonNullScalarType GraphQL.boolean))])
