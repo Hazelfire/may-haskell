@@ -1,6 +1,8 @@
 {-# LANGUAGE DeriveGeneric  #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module May
     ( handler
@@ -76,9 +78,6 @@ meType = GraphQLOut.NonNullObjectType $ GraphQLOut.ObjectType "Me" Nothing [] (H
 data Node = TaskNode Task
           | FolderNode Folder
 
-instance ToGraphQL Node where
-  toGraphQL (TaskNode task) = toGraphQL task
-  toGraphQL (FolderNode folder) = toGraphQL folder
   
 
 data Task = Task
@@ -101,15 +100,6 @@ instance FromDynamoDBRecord Folder where
     name <- stringField record "name"
     parent <- stringField record "pid"
     pure $ Folder fid name parent
-
-instance ToGraphQL Folder where
-  toGraphQL (Folder{folderId=fid,folderName=name,folderParent=parent}) = GraphQL.Object (HashMap.fromList 
-                [ ("id", GraphQL.String fid)
-                , ("name", GraphQL.String name)
-                , ("parent", GraphQL.String parent)
-                , ("__typename", GraphQL.String "Folder")
-                ]
-                )
     
     
 type Parser a = Either Text a
@@ -157,32 +147,116 @@ instance FromDynamoDBRecord Task where
      let due = Time.posixSecondsToUTCTime . fromInteger . floor .(/1000) <$> dueMilis
      pure $ Task tid name pid duration due
 
-class ToGraphQL a where
-   toGraphQL ::  a -> GraphQL.Value
 
-instance ToGraphQL Task where
-  toGraphQL (Task{taskId=tid,taskName=name,taskParent=pid,taskDuration=duration,taskDue=dueM}) = GraphQL.Object (HashMap.fromList (
-    case dueM of 
-      Just due -> 
-        [("__typename", GraphQL.String "Task")
-        , ("name", GraphQL.String name)
-        , ("duration", GraphQL.Float duration)
-        , ("id", GraphQL.String tid)
-        , ("due", GraphQL.String . Text.pack $ ISO8601.formatISO8601Millis due)
-        , ("parent", GraphQL.String pid)
-        ]
-      Nothing ->
-        [("__typename", GraphQL.String "Task")
-        , ("name", GraphQL.String name)
-        , ("duration", GraphQL.Float duration)
-        , ("parent", GraphQL.String pid)
-        , ("id", GraphQL.String tid)
-        ]
-      ))
+data GraphQLOutType m a = GraphQLOutType (GraphQLOut.Type m) (a -> GraphQL.Value)
+
+data GraphQLOutField m a = GraphQLOutField (Text, GraphQL.Resolver m) (a -> GraphQL.Value)
+
+  
+class ToGraphQL a where
+  graphqlOutSchema :: Catch.MonadThrow m => GraphQLOutType m a
+
+instance ToGraphQL Text where
+  graphqlOutSchema = GraphQLOutType (GraphQLOut.NonNullScalarType GraphQL.string) GraphQL.String
+
+instance ToGraphQL Double where
+  graphqlOutSchema = GraphQLOutType (GraphQLOut.NonNullScalarType GraphQL.float) GraphQL.Float
+
+instance ToGraphQL Time.UTCTime where
+  graphqlOutSchema = GraphQLOutType (GraphQLOut.NonNullScalarType GraphQL.string) (GraphQL.String . Text.pack . ISO8601.formatISO8601)
 
 instance ToGraphQL a => ToGraphQL [a] where
-  toGraphQL list = GraphQL.List (map toGraphQL list)
+  graphqlOutSchema = 
+    let 
+      (GraphQLOutType childType encode) = graphqlOutSchema
+    in
+      GraphQLOutType (GraphQLOut.NonNullListType childType) (GraphQL.List . fmap encode)
 
+instance ToGraphQL a => ToGraphQL (Maybe a) where
+  graphqlOutSchema = 
+    let 
+      (GraphQLOutType childType encode) = graphqlOutSchema
+      newEncode = \case
+         Just val -> encode val
+         Nothing -> GraphQL.Null
+      newType = 
+        case childType of
+          GraphQLOut.NonNullScalarType a -> GraphQLOut.NamedScalarType a
+          GraphQLOut.NonNullObjectType a -> GraphQLOut.NamedObjectType a
+          GraphQLOut.NonNullListType a -> GraphQLOut.ListType a
+          GraphQLOut.NamedUnionType a -> GraphQLOut.NamedUnionType a
+          a -> a
+    in
+      GraphQLOutType newType newEncode
+      
+instance ToGraphQL Folder where
+  graphqlOutSchema = 
+    outputObject "Folder" "a folder node" $ 
+      [ gqlOutField "id" "the id of the folder" folderId
+      , gqlOutField "name" "the name of the folder" folderName
+      , gqlOutField "parent" "the parent of the folder (containing folder)" folderParent
+      ]
+
+instance ToGraphQL Node where
+  graphqlOutSchema = 
+    let
+      -- This is not total, but if this fails, I want the system to crash because it never should
+      (GraphQLOutType (GraphQLOut.NonNullObjectType folderType_) encodeFolder) = graphqlOutSchema 
+      (GraphQLOutType (GraphQLOut.NonNullObjectType taskType_) encodeTask) = graphqlOutSchema
+      type_ = GraphQLOut.NonNullUnionType (GraphQLOut.UnionType "Node" (Just "a node (folder or task)") [taskType_, folderType_])
+    in
+     GraphQLOutType type_ $ \case
+       FolderNode folder -> encodeFolder folder
+       TaskNode task -> encodeTask task
+
+gqlOutField :: (Catch.MonadThrow m, ToGraphQL b) => Text -> Text -> (a -> b) -> GraphQLOutField m a
+gqlOutField name description getter = 
+  let
+    (GraphQLOutType childType encode) = graphqlOutSchema
+    resolve = do
+     value <- asks GraphQL.values
+     let object =
+          case value of
+            GraphQL.Object obj -> Just obj
+            _ -> Nothing
+     case HashMap.lookup name =<< object of
+      Just val-> pure val
+      _ -> 
+        case childType of
+          GraphQLOut.NamedScalarType _ -> pure GraphQL.Null
+          GraphQLOut.NamedObjectType _ -> pure GraphQL.Null
+          GraphQLOut.NamedInterfaceType _ -> pure GraphQL.Null
+          GraphQLOut.NamedUnionType _ -> pure GraphQL.Null
+          _ -> 
+            Catch.throwM (GraphQL.ResolverException (ServerError $ Text.concat ["could not resolve field ", name]))
+  in
+    GraphQLOutField (name, GraphQLOut.ValueResolver (GraphQLOut.Field (Just description) childType HashMap.empty) resolve) (encode . getter)
+
+graphOutFieldConvert :: a -> GraphQLOutField m a -> (Text, GraphQL.Value)
+graphOutFieldConvert val (GraphQLOutField (name, _) encode) = 
+  (name, encode val)
+
+outputObject :: Catch.MonadThrow m => Text -> Text -> [GraphQLOutField m a] -> GraphQLOutType m a
+outputObject name description fields =
+  let 
+    newFields = gqlOutField "__typename" "type" (const name)  : fields 
+    newEncode = \obj -> 
+       GraphQL.Object (HashMap.fromList (List.map (graphOutFieldConvert obj) newFields))
+    type_ = GraphQLOut.NonNullObjectType $ GraphQLOut.ObjectType name (Just description) [] (HashMap.fromList (List.map (\(GraphQLOutField childType _) -> childType) newFields))
+  in GraphQLOutType type_ newEncode
+
+
+  
+
+instance ToGraphQL Task where
+  graphqlOutSchema = 
+    outputObject "Task" "a task node" $ 
+      [ gqlOutField "id" "the id of the task" taskId
+      , gqlOutField "name" "the name of the task" taskName
+      , gqlOutField "parent" "the parent of the task (containing folder)" taskParent
+      , gqlOutField "duration" "the duration of the task in hours" taskDuration
+      , gqlOutField "due" "the duration of the task in hours" taskDue
+      ]
 
 data UnauthenticatedException = UnauthenticatedException
 
@@ -217,14 +291,19 @@ collectErrors lst =
     lefts -> Left $ Text.intercalate ", " lefts
 
 nodesResolver :: GraphQLOut.Resolver MyIO
-nodesResolver = GraphQLOut.ValueResolver nodesField $ do
-  sub <- lift getSub
-  let query = DynamoDB.query "MayNodeTable" & DynamoDB.qKeyConditionExpression .~ Just "user_id = :user_id" & DynamoDB.qExpressionAttributeValues .~ (HashMap.fromList [(":user_id", DynamoDB.attributeValue &  DynamoDB.avS .~ Just sub)])
-  response <- AWS.send query
-  case collectErrors $ List.map fromDynamoDB (response^.DynamoDB.qrsItems) :: Parser [Node] of
-    Right values -> pure $ toGraphQL values
-    Left err -> 
-      Catch.throwM (GraphQL.ResolverException (ServerError err))
+nodesResolver = 
+  let
+    (GraphQLOutType type_ encoder) = graphqlOutSchema
+  in
+
+    GraphQLOut.ValueResolver (GraphQLOut.Field (Just "all the nodes of the user") type_ HashMap.empty) $ do
+    sub <- lift getSub
+    let query = DynamoDB.query "MayNodeTable" & DynamoDB.qKeyConditionExpression .~ Just "user_id = :user_id" & DynamoDB.qExpressionAttributeValues .~ (HashMap.fromList [(":user_id", DynamoDB.attributeValue &  DynamoDB.avS .~ Just sub)])
+    response <- AWS.send query
+    case collectErrors $ List.map fromDynamoDB (response^.DynamoDB.qrsItems) :: Parser [Node] of
+      Right values -> pure $ encoder values
+      Left err -> 
+        Catch.throwM (GraphQL.ResolverException (ServerError err))
 
 getSub :: MyIO Text
 getSub = do
@@ -233,35 +312,6 @@ getSub = do
     Just sub -> pure sub
     Nothing -> 
       Catch.throwM (GraphQL.ResolverException UnauthenticatedException)
-  
-
-nodesField :: GraphQLOut.Field MyIO
-nodesField = GraphQLOut.Field (Just "All the nodes of a user" ) nodesType HashMap.empty
-
-nodesType :: GraphQLOut.Type MyIO
-nodesType = GraphQLOut.NonNullListType nodeType
-
-nodeType :: GraphQLOut.Type MyIO
-nodeType  = GraphQLOut.NonNullUnionType (GraphQLOut.UnionType "Node" (Just "a node (folder or task)") [taskType, folderType])
-
-folderType :: GraphQLOut.ObjectType MyIO
-folderType = GraphQLOut.ObjectType "Folder" (Just "a folder") [] (HashMap.fromList 
-   [ ("name", fieldResolver "name" "the name of the folder" (GraphQLOut.NonNullScalarType GraphQL.string) )
-   , ("parent", fieldResolver "parent" "The id of the folder that contains this folder" (GraphQLOut.NonNullScalarType GraphQL.id) )
-   , ("id", fieldResolver "id" "The id of this folder" (GraphQLOut.NonNullScalarType GraphQL.id) )
-   , ("__typename", fieldResolver "__typename" "type" (GraphQLOut.NonNullScalarType GraphQL.string))
-   ])
-
-taskType :: GraphQLOut.ObjectType MyIO
-taskType = GraphQLOut.ObjectType "Task" (Just "a task") [] (HashMap.fromList 
-   [ ("name", fieldResolver "name" "the name of the task" (GraphQLOut.NonNullScalarType GraphQL.string) )
-   , ("id", fieldResolver "id" "the unique id of the task" (GraphQLOut.NonNullScalarType GraphQL.string) )
-   , ("due", fieldResolver "due" "the timestamp of when the task is due" (GraphQLOut.NamedScalarType GraphQL.string) )
-   , ("parent", fieldResolver "parent" "The id of the folder that contains that task" (GraphQLOut.NonNullScalarType GraphQL.id) )
-   , ("duration", fieldResolver "duration" "the duration of the task in hours" (GraphQLOut.NonNullScalarType GraphQL.float) )
-   , ("__typename", fieldResolver "__typename" "type" (GraphQLOut.NonNullScalarType GraphQL.string))
-   ])
-
 
 
 fieldResolver :: Text -> Text -> GraphQLOut.Type MyIO -> GraphQLOut.Resolver MyIO
