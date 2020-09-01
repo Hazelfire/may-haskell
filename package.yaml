@@ -29,6 +29,7 @@ dependencies:
 - unordered-containers
 - hspec
 - amazonka-dynamodb
+- amazonka-cognito-idp
 - mtl
 - jwt
 - amazonka
@@ -40,12 +41,16 @@ dependencies:
 - warp
 - iso8601-time
 - time
+- aeson-qq
+- wreq
+- containers
 
 
 library:
   source-dirs: src
 ghc-options:
   - -Wall
+  - -Wwarn
 
 executables:
   may-haskell-exe:

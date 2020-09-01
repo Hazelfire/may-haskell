@@ -26,19 +26,27 @@ source-repository head
 library
   exposed-modules:
       May
+      May.Errors
+      May.Mock
       May.Query
+      May.ServerlessMayMonad
+      May.Stripe.Types
+      May.Types
   other-modules:
       Paths_may_haskell
   hs-source-dirs:
       src
-  ghc-options: -Wall
+  ghc-options: -Wall -Wwarn
   build-depends:
       aeson
+    , aeson-qq
     , amazonka
+    , amazonka-cognito-idp
     , amazonka-core
     , amazonka-dynamodb
     , base >=4.7 && <5
     , bytestring
+    , containers
     , exceptions
     , graphql >=0.9.0.0
     , hspec
@@ -53,6 +61,7 @@ library
     , unordered-containers
     , wai
     , warp
+    , wreq
   default-language: Haskell2010
 
 executable may-haskell-dev-server
@@ -61,14 +70,17 @@ executable may-haskell-dev-server
       Paths_may_haskell
   hs-source-dirs:
       dev
-  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Wall -Wwarn -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       aeson
+    , aeson-qq
     , amazonka
+    , amazonka-cognito-idp
     , amazonka-core
     , amazonka-dynamodb
     , base >=4.7 && <5
     , bytestring
+    , containers
     , exceptions
     , graphql >=0.9.0.0
     , hspec
@@ -84,6 +96,7 @@ executable may-haskell-dev-server
     , unordered-containers
     , wai
     , warp
+    , wreq
   default-language: Haskell2010
 
 executable may-haskell-exe
@@ -92,14 +105,17 @@ executable may-haskell-exe
       Paths_may_haskell
   hs-source-dirs:
       app
-  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Wall -Wwarn -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       aeson
+    , aeson-qq
     , amazonka
+    , amazonka-cognito-idp
     , amazonka-core
     , amazonka-dynamodb
     , base >=4.7 && <5
     , bytestring
+    , containers
     , exceptions
     , graphql >=0.9.0.0
     , hspec
@@ -115,23 +131,29 @@ executable may-haskell-exe
     , unordered-containers
     , wai
     , warp
+    , wreq
   default-language: Haskell2010
 
 test-suite may-haskell-test
   type: exitcode-stdio-1.0
   main-is: Main.hs
   other-modules:
+      Spec.MockCalls
+      Spec.Subscribed
       Paths_may_haskell
   hs-source-dirs:
       test
-  ghc-options: -Wall -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Wall -Wwarn -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       aeson
+    , aeson-qq
     , amazonka
+    , amazonka-cognito-idp
     , amazonka-core
     , amazonka-dynamodb
     , base >=4.7 && <5
     , bytestring
+    , containers
     , exceptions
     , graphql >=0.9.0.0
     , hspec
@@ -147,4 +169,5 @@ test-suite may-haskell-test
     , unordered-containers
     , wai
     , warp
+    , wreq
   default-language: Haskell2010

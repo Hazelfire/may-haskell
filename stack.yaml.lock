@@ -11,6 +11,13 @@ packages:
       sha256: 469b092c1a47ca527a25e1046c9d30adad2c9c6a086871190a5c6cb744c7f3ac
   original:
     hackage: serverless-haskell-0.12.1
+- completed:
+    hackage: graphql-0.9.0.0@sha256:068afd21bd580fe3f316075828e4c01cc7418512b2b7bd59191364682d9eeed8,3686
+    pantry-tree:
+      size: 3303
+      sha256: 91ccefaf8be52553cc835ae586121754e435c246560479fc461b696d08943f32
+  original:
+    hackage: graphql-0.9.0.0@sha256:068afd21bd580fe3f316075828e4c01cc7418512b2b7bd59191364682d9eeed8,3686
 snapshots:
 - completed:
     size: 532383

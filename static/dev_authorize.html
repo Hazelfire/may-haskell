@@ -1,0 +1,12 @@
+<html>
+  <head>Development auth server</head>
+  <body>
+    Auth server, Redirecting back to client...
+  <script>
+const params = new URLSearchParams(window.location.search)
+if(params.has('redirect_uri')){
+  window.location.replace(params.get('redirect_uri') + '?code=testcode');
+}
+  </script>
+  </body>
+</html>

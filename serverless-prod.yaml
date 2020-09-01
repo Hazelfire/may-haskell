@@ -1,4 +1,4 @@
-service: maybackend-staging
+service: maybackend
 
 provider:
   name: aws
@@ -9,7 +9,7 @@ provider:
     authorizers:
       authorizer:
         identitySource: $request.header.Authorization
-        issuerUrl: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_8WbD5F0SG
+        issuerUrl: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_bdCLHt4be
         audience:
           - 1qu0jlg90401pc5lf41jukbd15
   iamRoleStatements:
@@ -29,12 +29,12 @@ provider:
           - cognito-idp:AdminDeleteUser
           - cognito-idp:AdminAddUserToGroup
         Resource:
-          - "arn:aws:cognito-idp:us-east-1:659023026482:userpool/us-east-1_8WbD5F0SG"
+          - "arn:aws:cognito-idp:us-east-1:659023026482:userpool/us-east-1_bdCLHt4be"
   environment:
-    STRIPE_API_KEY: ${env:STRIPE_API_KEY_STAGING}
-    USER_TABLE_NAME: MayUserTableStaging
-    NODE_TABLE_NAME: MayNodeTableStaging
-    COGNITO_POOL: us-east-1_8WbD5F0SG
+    STRIPE_API_KEY: ${env:STRIPE_API_KEY}
+    USER_TABLE_NAME: MayUserTable
+    NODE_TABLE_NAME: MayNodeTable
+    COGNITO_POOL: us-east-1_bdCLHt4be
 
 plugins:
   - serverless-haskell
@@ -62,7 +62,7 @@ resources:
     MayUserTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: MayUserTableStaging
+        TableName: MayUserTable
         AttributeDefinitions:
           - AttributeName: user_id
             AttributeType: S
@@ -75,7 +75,7 @@ resources:
     MayNodeTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: MayNodeTableStaging
+        TableName: MayNodeTable
         AttributeDefinitions:
           - AttributeName: user_id
             AttributeType: S
