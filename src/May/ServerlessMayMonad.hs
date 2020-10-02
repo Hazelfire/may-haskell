@@ -8,6 +8,7 @@ module May.ServerlessMayMonad (ServerlessMayMonad, runServerlessMayMonad, Contex
 import           May
 import           Control.Monad.Reader           ( ReaderT
                                                 , asks
+                                                , void
                                                 , runReaderT
                                                 , MonadReader
                                                 , MonadIO
@@ -16,6 +17,7 @@ import           Control.Monad.Reader           ( ReaderT
 import qualified Network.AWS                   as AWS
 import qualified Network.AWS.DynamoDB.Query    as DynamoDB
 import qualified Network.AWS.DynamoDB.GetItem  as DynamoDB
+import qualified Network.AWS.DynamoDB.DeleteItem  as DynamoDB
 import qualified Network.AWS.DynamoDB.PutItem  as DynamoDB
 import qualified Network.AWS.DynamoDB.BatchWriteItem
                                                as DynamoDB
@@ -48,8 +50,11 @@ import           Text.Read                      ( readMaybe )
 import           System.Environment             ( getEnv )
 import           May.Types                     as Types
 import qualified Network.Wreq                  as Wreq
-import qualified Control.Monad.Trans.AWS       as AWS hiding (send)
-import           Data.ByteString.Lazy (ByteString)
+import qualified Control.Monad.Trans.AWS       as AWS
+                                         hiding ( send )
+import           Data.ByteString.Lazy           ( ByteString )
+import qualified Control.Exception.Lens        as Lens
+import qualified Network.HTTP.Types.Status     as HTTP
 
 newtype ServerlessMayMonad a = ServerlessMayMonad { runServerlessMayMonadInternal :: ReaderT Context AWS.AWS a }
   deriving (Functor, Applicative, Monad, Catch.MonadThrow, Catch.MonadCatch, MonadReader Context, MonadIO, AWS.MonadAWS )
@@ -72,8 +77,8 @@ getSub  = do
 instance MonadMay ServerlessMayMonad where
   getNodes = do
     sub <- getSub
-    userTableName <- getUserTableName
-    let query = DynamoDB.query userTableName & DynamoDB.qKeyConditionExpression .~ Just "user_id = :user_id" & DynamoDB.qExpressionAttributeValues .~ (HashMap.fromList [(":user_id", dynoString sub)])
+    nodeTableName <- getNodeTableName
+    let query = DynamoDB.query nodeTableName & DynamoDB.qKeyConditionExpression .~ Just "user_id = :user_id" & DynamoDB.qExpressionAttributeValues .~ (HashMap.fromList [(":user_id", dynoString sub)])
     response <- AWS.send query
     case collectErrors $ List.map fromDynamoDB (response^.DynamoDB.qrsItems) :: Parser [Node] of
       Right values -> pure values
@@ -102,10 +107,33 @@ instance MonadMay ServerlessMayMonad where
     sub <- getSub
     userPool <- getCognitoPoolName
     let query = Cognito.adminDeleteUser userPool sub
-    _ <- AWS.send query
-    True <$ stripeDeleteCustomer sub
+    _ <- cognitoDeleteUser query
+    sid <- dynoDeleteUser sub
+    True <$ stripeDeleteCustomer sid
   
 
+dynoDeleteUser :: Text -> ServerlessMayMonad Text
+dynoDeleteUser sub = do
+    userTableName <- getUserTableName
+    let query = DynamoDB.deleteItem userTableName & DynamoDB.diReturnValues .~ Just DynamoDB.AllOld
+                                                  & DynamoDB.diKey .~ (HashMap.fromList [("user_id", dynoString sub)])
+
+    response <- AWS.send query
+    case fromDynamoDB (response^.DynamoDB.dirsAttributes) of
+      Right user -> pure $ mayUserStripeId user
+      Left err -> Catch.throwM (ServerError err)
+  
+   
+
+cognitoDeleteUser :: Cognito.AdminDeleteUser -> ServerlessMayMonad ()
+cognitoDeleteUser request = 
+  Lens.catching AWS._ServiceError (void $ AWS.send request) $ \serviceError -> 
+    if serviceError^.AWS.serviceCode == "UserNotFound" then
+      liftIO (putStrLn "Cognito user already deleted")
+    else
+      Catch.throwM (ServerError . Text.pack $ "error with deleting user: " ++ show serviceError )
+     
+  
 
       
 setUserGroupAsSubscriber :: ServerlessMayMonad ()
@@ -130,18 +158,26 @@ getNodeTableName = serverlessGetEnv "NODE_TABLE_NAME"
 getCognitoPoolName :: MonadIO m => m Text
 getCognitoPoolName = serverlessGetEnv "COGNITO_POOL"
 
+getStripePrice :: MonadIO m => m Text
+getStripePrice = serverlessGetEnv "STRIPE_PRICE"
+
+getFrontendURL :: MonadIO m => m Text
+getFrontendURL = serverlessGetEnv "FRONTEND_URL"
+
 createStripeSubscriptionSession :: StripeCustomer -> ServerlessMayMonad Text
 createStripeSubscriptionSession su = do
   stripe_key <- getStripeKey
+  stripe_price <- getStripePrice
+  frontEndUrl <- getFrontendURL
   let wreqOptions = Wreq.defaults & Wreq.headers .~ [("authorization", Text.encodeUtf8 $ Text.concat [ "Bearer ", stripe_key] ), ("content-type", "application/x-www-form-urlencoded")]
       createStripeSubscriptionSessionBody = 
         Text.encodeUtf8 $ Text.intercalate "&"
-                    [ "cancel_url=https://may.hazelfire.net/"
+                    [ Text.append "cancel_url=" frontEndUrl
                     , "mode=subscription"
-                    , "success_url=https://may.hazelfire.net/"
+                    , Text.append "success_url=" frontEndUrl
                     , Text.append "customer=" (stripeCustomerId su)
                     , "payment_method_types[0]=card"
-                    , "line_items[0][price]=price_1HKKB6G8oceMBUSBDtzZfkbg"
+                    , Text.append "line_items[0][price]=" stripe_price
                     , "line_items[0][quantity]=1"
                     ]
   response <- liftIO $ Wreq.postWith wreqOptions (Text.unpack $ Text.concat [stripeBaseUrl, "/v1/checkout/sessions"])  createStripeSubscriptionSessionBody

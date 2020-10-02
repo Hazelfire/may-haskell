@@ -10,17 +10,14 @@ import qualified Control.Monad.Catch.Pure      as Catch
 import qualified Data.HashMap.Strict           as HashMap
 import           Data.Text                      ( Text )
 import qualified May.Types                     as Types
-import qualified May.Stripe.Types              as Stripe
 
 data MayState = MayState 
   { stateNodes :: HashMap.HashMap Text Types.Node
   , stateHasSubscription :: Bool
-  , stateEmailsSent :: [Types.EmailRequest]
-  , stateStripeCustomers :: HashMap.HashMap Text Stripe.Customer
   }
 
 initial :: MayState
-initial = MayState (HashMap.fromList []) False [] (HashMap.fromList [])
+initial = MayState (HashMap.fromList []) False
 
 newtype MockMayMonad a = MockMayMonad { runMockMonadInternal :: Catch.CatchT (State.State MayState) a }
   deriving (Monad, Applicative, Functor, Catch.MonadThrow, Catch.MonadCatch, State.MonadState MayState)
@@ -31,10 +28,6 @@ instance Types.MonadMay MockMayMonad where
   getSubscription = stateHasSubscription <$> State.get
   deleteUser = pure True
   getSubscriptionSession = pure "session"
-  getStripeCustomer (Stripe.CustomerId cid) = do
-    HashMap.lookup cid . stateStripeCustomers <$> State.get
-  setSubscription _ newSub = State.state $ \state -> ((), state { stateHasSubscription = newSub}) 
-  sendEmail request = State.state $ \state -> ((), state { stateEmailsSent = request : stateEmailsSent state}) 
 
 applyCommand :: Types.PatchCommand -> MockMayMonad ()
 applyCommand (Types.DeleteCommand nodeId) = 

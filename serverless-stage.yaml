@@ -1,4 +1,4 @@
-service: maybackend
+service: maybackend-staging
 
 provider:
   name: aws
@@ -9,9 +9,9 @@ provider:
     authorizers:
       authorizer:
         identitySource: $request.header.Authorization
-        issuerUrl: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_bdCLHt4be
-        audience:
-          - 1qu0jlg90401pc5lf41jukbd15
+        issuerUrl: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_8WbD5F0SG
+        audience: 
+          - ${env:COGNITO_STAGING_AUDIENCE}
   iamRoleStatements:
       - Effect: Allow
         Action:
@@ -22,19 +22,21 @@ provider:
           - dynamodb:PutItem
           - dynamodb:DeleteItem
         Resource: 
-          - "arn:aws:dynamodb:${self:provider.region}:*:table/MayUserTable"
-          - "arn:aws:dynamodb:${self:provider.region}:*:table/MayNodeTable"
+          - "arn:aws:dynamodb:${self:provider.region}:*:table/MayUserTableStaging"
+          - "arn:aws:dynamodb:${self:provider.region}:*:table/MayNodeTableStaging"
       - Effect: Allow
         Action:
           - cognito-idp:AdminDeleteUser
           - cognito-idp:AdminAddUserToGroup
         Resource:
-          - "arn:aws:cognito-idp:us-east-1:659023026482:userpool/us-east-1_bdCLHt4be"
+          - "arn:aws:cognito-idp:us-east-1:659023026482:userpool/us-east-1_8WbD5F0SG"
   environment:
-    STRIPE_API_KEY: ${env:STRIPE_API_KEY}
-    USER_TABLE_NAME: MayUserTable
-    NODE_TABLE_NAME: MayNodeTable
-    COGNITO_POOL: us-east-1_bdCLHt4be
+    STRIPE_API_KEY: ${env:STRIPE_API_KEY_STAGING}
+    FRONTEND_URL: https://stage.may.hazelfire.net/
+    STRIPE_PRICE: ${env:STRIPE_PRICE_STAGING}
+    USER_TABLE_NAME: MayUserTableStaging
+    NODE_TABLE_NAME: MayNodeTableStaging
+    COGNITO_POOL: ${env:COGNITO_POOL_STAGING}
 
 plugins:
   - serverless-haskell
@@ -62,7 +64,7 @@ resources:
     MayUserTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: MayUserTable
+        TableName: MayUserTableStaging
         AttributeDefinitions:
           - AttributeName: user_id
             AttributeType: S
@@ -75,7 +77,7 @@ resources:
     MayNodeTable:
       Type: AWS::DynamoDB::Table
       Properties:
-        TableName: MayNodeTable
+        TableName: MayNodeTableStaging
         AttributeDefinitions:
           - AttributeName: user_id
             AttributeType: S

@@ -351,7 +351,7 @@ deleteUserResolver :: Types.MonadMay m => GraphQLOut.Resolver m
 deleteUserResolver =
   wrapResolver "deletes the requesting user" $ do
     nodes <- Types.getNodes
-    Types.batchPatch (map nodeToDelete nodes)
+    Types.batchPatch (take 25 (map nodeToDelete nodes))
     OkResult <$> Types.deleteUser
 
 requestSubscriptionSessionResolver :: Types.MonadMay m => GraphQLOut.Resolver m
