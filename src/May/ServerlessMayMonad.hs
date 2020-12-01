@@ -15,16 +15,8 @@ import           Control.Monad.Reader           ( ReaderT
                                                 , liftIO
                                                 )
 import qualified Network.AWS                   as AWS
-import qualified Network.AWS.DynamoDB.Query    as DynamoDB
-import qualified Network.AWS.DynamoDB.GetItem  as DynamoDB
-import qualified Network.AWS.DynamoDB.DeleteItem  as DynamoDB
-import qualified Network.AWS.DynamoDB.PutItem  as DynamoDB
-import qualified Network.AWS.DynamoDB.BatchWriteItem
-                                               as DynamoDB
-import qualified Network.AWS.DynamoDB.Types    as DynamoDB
-import qualified Network.AWS.CognitoIdentityProvider.AdminAddUserToGroup
-                                               as Cognito
-import qualified Network.AWS.CognitoIdentityProvider.AdminDeleteUser
+import qualified Network.AWS.DynamoDB          as DynamoDB
+import qualified Network.AWS.CognitoIdentityProvider
                                                as Cognito
 import qualified Data.Aeson                    as Aeson
 import           Data.Aeson                     ((.:))
@@ -54,7 +46,6 @@ import qualified Control.Monad.Trans.AWS       as AWS
                                          hiding ( send )
 import           Data.ByteString.Lazy           ( ByteString )
 import qualified Control.Exception.Lens        as Lens
-import qualified Network.HTTP.Types.Status     as HTTP
 
 newtype ServerlessMayMonad a = ServerlessMayMonad { runServerlessMayMonadInternal :: ReaderT Context AWS.AWS a }
   deriving (Functor, Applicative, Monad, Catch.MonadThrow, Catch.MonadCatch, MonadReader Context, MonadIO, AWS.MonadAWS )
@@ -110,6 +101,24 @@ instance MonadMay ServerlessMayMonad where
     _ <- cognitoDeleteUser query
     sid <- dynoDeleteUser sub
     True <$ stripeDeleteCustomer sid
+  getUsers = do
+    userPool <- getCognitoPoolName
+    let query = Cognito.listUsers userPool
+    result <- AWS.send query
+    let users = result ^. Cognito.lursUsers
+    
+    return . Maybe.catMaybes $ map (\user -> do
+        let attributes = user ^. Cognito.utAttributes
+            nameL = filter (\attribute -> attribute ^. Cognito.atName == "name") attributes
+            subL = filter (\attribute -> attribute ^. Cognito.atName == "sub") attributes
+        case (nameL, subL) of
+          ([nameA], [subA]) -> do
+            sub <- subA ^. Cognito.atValue
+            name <- nameA ^. Cognito.atValue
+            return $ Types.User sub name
+          _ -> Nothing
+        ) users
+
   
 
 dynoDeleteUser :: Text -> ServerlessMayMonad Text
@@ -252,17 +261,14 @@ instance Aeson.FromJSON StripeCustomer where
      subList <- subscription .: "data"
      return $ StripeCustomer sid (length (subList :: [Aeson.Value]) > 0)
 
-toMaybe :: Either b a -> Maybe a
-toMaybe e =
-  case e of 
-    Right a -> Just a
-    Left _ -> Nothing
 data MayUser = MayUser {mayUserSub :: Text, mayUserStripeId :: Text}
+
 instance FromDynamoDBRecord MayUser where
   fromDynamoDB record = do
     user_id <- stringField record "user_id"
     stripe_id <- stringField record "stripe_id"
     pure $ MayUser user_id stripe_id
+
 instance ToDynamoDb MayUser where
   toDynamoDb (MayUser sub sid) = HashMap.fromList 
     [ ("user_id", dynoString sub)
@@ -285,7 +291,8 @@ instance FromDynamoDBRecord Folder where
     fid <- stringField record "node_id"
     name <- stringField record "name"
     parent <- stringField record "pid"
-    pure $ Folder fid name parent
+    sharedWith <- stringField record "sharedWith"
+    pure $ Folder fid name parent sharedWith
 
 timeField :: HashMap.HashMap Text DynamoDB.AttributeValue -> Text -> Parser Time.UTCTime
 timeField record name =

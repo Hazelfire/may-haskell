@@ -112,6 +112,13 @@ instance ToGraphQL Types.Task where
         , gqlOutField "doneOn" "when the task was completed" Types.taskDoneOn
         ]
 
+instance ToGraphQL Types.User where
+  graphqlOutSchema =
+    outputObject "User" "a user node"
+      $ [ gqlOutField "id"   "the id of the user"   Types.userId
+        , gqlOutField "name" "the name of the user" Types.userName
+        ]
+
 type Parser a = Either Text a
 
 maybeToRight :: a -> Maybe b -> Either a b
@@ -177,6 +184,9 @@ instance ToGraphQL Types.Folder where
         , gqlOutField "parent"
                       "the parent of the folder (containing folder)"
                       Types.folderParent
+        , gqlOutField "shareId"
+                      "the shareId of the folder"
+                      Types.folderShareId
         ]
 
 instance ToGraphQL Types.Node where
@@ -338,7 +348,10 @@ schema = GraphQL.Schema
   Nothing
 
 resolvers :: Types.MonadMay m => HashMap.HashMap Text (GraphQLOut.Resolver m)
-resolvers = HashMap.fromList [("me", meResolver)]
+resolvers = HashMap.fromList [("me", meResolver), ("users", usersResolver)]
+
+usersResolver :: Types.MonadMay m => GraphQLOut.Resolver m
+usersResolver = wrapResolver "gets all users" Types.getUsers
 
 mutations :: Types.MonadMay m => HashMap.HashMap Text (GraphQLOut.Resolver m)
 mutations = HashMap.fromList

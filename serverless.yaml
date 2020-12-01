@@ -28,6 +28,7 @@ provider:
         Action:
           - cognito-idp:AdminDeleteUser
           - cognito-idp:AdminAddUserToGroup
+          - cognito-idp:ListUsers
         Resource:
           - "arn:aws:cognito-idp:us-east-1:659023026482:userpool/us-east-1_bdCLHt4be"
   environment:

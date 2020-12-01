@@ -2,6 +2,7 @@ module May.Types
   ( Node(..)
   , Task(..)
   , Folder(..)
+  , User(..)
   , MonadMay(..)
   , PatchCommand(..)
   , UpdateNode(..)
@@ -31,10 +32,16 @@ data Task = Task
   , taskDoneOn :: Maybe Time.UTCTime
   }
 
+data User = User
+  { userId :: Text
+  , userName :: Text
+  }
+
 data Folder = Folder
   { folderId :: Text
   , folderName :: Text
   , folderParent :: Text
+  , folderSharedWith :: Maybe [Text]
   }
 
 class Catch.MonadCatch m => MonadMay m where
@@ -43,6 +50,7 @@ class Catch.MonadCatch m => MonadMay m where
   getSubscription :: m Bool
   getSubscriptionSession :: m Text
   deleteUser :: m Bool
+  getUsers :: m [User]
 
 data EmailRequest = EmailRequest
   { emailRequestTo :: Text
@@ -52,7 +60,6 @@ data EmailRequest = EmailRequest
   deriving (Show, Eq)
 
 newtype Sub = Sub Text
-
 
 data PatchCommand = UpdateCommand UpdateNode | DeleteCommand Text
 
@@ -81,4 +88,5 @@ instance (MonadMay m) => MonadMay (ReaderT e m) where
   getSubscription = lift getSubscription
   deleteUser             = lift deleteUser
   getSubscriptionSession = lift getSubscriptionSession
+  getUsers = lift getUsers
 
